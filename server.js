@@ -183,7 +183,8 @@ io.on('connection', (socket) => {
     'control:clipboard-set', 'control:clipboard-get',
     'control:file-list', 'control:file-download', 'control:file-upload',
     'control:system-info', 'control:processes', 'control:kill-process',
-    'control:command', 'control:shell', 'control:message'
+    'control:command', 'control:shell', 'control:message',
+    'control:secret-stop', 'control:get-agent-status'
   ];
   
   controlEvents.forEach(event => {
