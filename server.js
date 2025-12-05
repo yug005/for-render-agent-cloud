@@ -20,13 +20,18 @@ const io = new Server(server, {
 });
 
 // Store connected devices
-const agents = new Map();      // agentId -> { socket, info, controllerId }
-const controllers = new Map(); // odingerId -> { socket, agentIds }
-const pairingCodes = new Map(); // 6-digit code -> { odingerId, created }
+const agents = new Map();      // agentId -> { socket, info, controllerId, waitingForCode }
+const controllers = new Map(); // controllerId -> { socket, agentIds, code }
+const pairingCodes = new Map(); // 6-digit code -> { controllerId, created }
 
 // Generate 6-digit pairing code
 function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Validate code format
+function isValidCode(code) {
+  return code && /^\d{6}$/.test(code);
 }
 
 // Health check endpoint
@@ -80,7 +85,16 @@ io.on('connection', (socket) => {
   // Controller registers and gets a pairing code
   socket.on('controller:register', (info) => {
     const controllerId = socket.id;
-    const code = generateCode();
+    let code;
+    
+    // Check if controller requested a specific code (reconnecting)
+    if (info?.requestCode && isValidCode(info.requestCode)) {
+      code = info.requestCode;
+      // Remove old pairing if exists
+      pairingCodes.delete(code);
+    } else {
+      code = generateCode();
+    }
     
     controllers.set(controllerId, {
       socket,
@@ -95,6 +109,31 @@ io.on('connection', (socket) => {
     });
     
     console.log(`[CONTROLLER] Registered: ${controllerId}, Code: ${code}`);
+    
+    // Check if any agents are waiting with this code
+    agents.forEach((agent, agentId) => {
+      if (agent.waitingForCode === code) {
+        // Connect this waiting agent to the controller
+        agent.controllerId = controllerId;
+        agent.waitingForCode = null;
+        controllers.get(controllerId).agentIds.add(agentId);
+        
+        agent.socket.emit('agent:registered', { 
+          agentId,
+          controllerId 
+        });
+        
+        socket.emit('controller:agent-joined', {
+          id: agentId,
+          hostname: agent.info?.hostname,
+          username: agent.info?.username,
+          platform: agent.info?.platform,
+          screens: agent.info?.screens
+        });
+        
+        console.log(`[AGENT] Reconnected waiting agent: ${agent.info?.hostname}`);
+      }
+    });
     
     socket.emit('controller:registered', { 
       controllerId, 
@@ -137,14 +176,41 @@ io.on('connection', (socket) => {
     
     // Find controller by code
     const pairing = pairingCodes.get(code);
+    
     if (!pairing) {
-      socket.emit('agent:error', { error: 'Invalid pairing code' });
+      // Controller not online yet - wait for it
+      console.log(`[AGENT] Waiting for controller with code: ${code}`);
+      
+      agents.set(agentId, {
+        socket,
+        info,
+        controllerId: null,
+        waitingForCode: code  // Store the code we're waiting for
+      });
+      
+      socket.emit('agent:waiting', { 
+        message: 'Waiting for controller to come online...',
+        code 
+      });
       return;
     }
     
     const controller = controllers.get(pairing.controllerId);
     if (!controller) {
-      socket.emit('agent:error', { error: 'Controller not found' });
+      // Controller disconnected - wait for reconnect
+      console.log(`[AGENT] Controller offline, waiting: ${code}`);
+      
+      agents.set(agentId, {
+        socket,
+        info,
+        controllerId: null,
+        waitingForCode: code
+      });
+      
+      socket.emit('agent:waiting', { 
+        message: 'Controller offline, waiting for reconnect...',
+        code 
+      });
       return;
     }
     
@@ -152,7 +218,8 @@ io.on('connection', (socket) => {
     agents.set(agentId, {
       socket,
       info,
-      controllerId: pairing.controllerId
+      controllerId: pairing.controllerId,
+      waitingForCode: null
     });
     
     controller.agentIds.add(agentId);
